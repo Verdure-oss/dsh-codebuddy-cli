@@ -46,6 +46,45 @@ describe('prepareChatBody', () => {
     expect(body['stream']).toBe(true)
   })
 
+  it('drops a reasoning level that came from another provider', () => {
+    // A real session switched from a `trae` selection carrying `extra_high`;
+    // pi-ai forwards an unmapped level verbatim and the provider rejects the
+    // whole request with 11133.
+    const body = JSON.parse(prepareChatBody(JSON.stringify({
+      model: 'deepseek-v4.1-flash',
+      messages: [{ role: 'user', content: 'hi' }],
+      reasoning_effort: 'extra_high',
+    })))
+    expect('reasoning_effort' in body).toBe(false)
+  })
+
+  it('drops a non-string reasoning_effort shape', () => {
+    const body = JSON.parse(prepareChatBody(JSON.stringify({
+      model: 'glm-5.3', messages: [], reasoning_effort: { type: 'enabled' },
+    })))
+    expect('reasoning_effort' in body).toBe(false)
+  })
+
+  it('normalizes the case and surroundings of a valid level', () => {
+    const body = JSON.parse(prepareChatBody(JSON.stringify({
+      model: 'glm-5.3', messages: [], reasoning_effort: '  XHIGH ',
+    })))
+    expect(body['reasoning_effort']).toBe('xhigh')
+  })
+
+  it('drops a level the selected model does not accept', () => {
+    const policy = (model: string): readonly string[] | undefined =>
+      model === 'glm-5.3' ? ['low', 'high', 'xhigh', 'off'] : undefined
+    const dropped = JSON.parse(prepareChatBody(JSON.stringify({
+      model: 'glm-5.3', messages: [], reasoning_effort: 'max',
+    }), policy))
+    expect('reasoning_effort' in dropped).toBe(false)
+    const kept = JSON.parse(prepareChatBody(JSON.stringify({
+      model: 'glm-5.3', messages: [], reasoning_effort: 'off',
+    }), policy))
+    expect(kept['reasoning_effort']).toBe('off')
+  })
+
   it('rewrites developer messages to system (upstream rejects developer)', () => {
     const body = JSON.parse(prepareChatBody(JSON.stringify({
       model: 'deepseek-v4-flash',
@@ -60,18 +99,22 @@ describe('prepareChatBody', () => {
     expect(body['reasoning_effort']).toBe('max')
   })
 
-  it('rewrites the harness identity banner in a system message', () => {
+  it('demotes a harness prompt carried by a developer message, text untouched', () => {
+    // DSH's own prompt arrives as `developer` (pi-ai's OpenAI shape). It becomes
+    // `system` first — the upstream rejects `developer` outright — and is then
+    // demoted to `user`, the role the channel check accepts. Demotion (not
+    // rewording) is what makes this stable across prompt changes.
     const content = 'You are an AI agent powered by DeepSeek Harness. Use tools carefully.'
     const body = JSON.parse(prepareChatBody(JSON.stringify({
       model: 'deepseek-v4-flash',
       messages: [{ role: 'developer', content }, { role: 'user', content: 'hi' }],
     })))
     const system = body['messages'][0] as { role: string, content: string }
-    expect(system.role).toBe('system')
-    expect(system.content).toBe('You are an AI agent. Use tools carefully.')
+    expect(system.role).toBe('user')
+    expect(system.content).toBe(content)
   })
 
-  it('rewrites the paired Web GUI sentences in text shards of a system message', () => {
+  it('demotes the paired Web GUI sentences carried as text shards', () => {
     const first = 'You are interacting with the user through the DeepSeek Harness Web GUI whose URL the runtime context names.'
     const second = 'When the user refers to "this page", "this GUI", or "this app" without naming another target, they mean this GUI.'
     const body = JSON.parse(prepareChatBody(JSON.stringify({
@@ -81,21 +124,31 @@ describe('prepareChatBody', () => {
         content: [{ type: 'text', text: `${first} ${second} The browser provides no implicit DOM.` }],
       }],
     })))
+    expect((body['messages'][0] as { role: string }).role).toBe('user')
     const text = (body['messages'][0] as { content: { type: string, text: string }[] }).content[0]!.text
-    expect(text).not.toContain('DeepSeek Harness')
-    expect(text).toContain('You are interacting with the user through the Web GUI whose URL the runtime context names.')
-    expect(text).toContain('and names no other target, that reference means this GUI.')
+    // The text is preserved verbatim: demotion, not rewording, is the fix.
+    expect(text).toContain('You are interacting with the user through the DeepSeek Harness Web GUI whose URL the runtime context names.')
     expect(text).toContain('The browser provides no implicit DOM.')
   })
 
-  it('rewrites the legacy Web GUI paragraph that embedded the URL directly', () => {
+  it('demotes the legacy Web GUI paragraph that embedded the URL directly', () => {
     const content = 'You are interacting with the user through the DeepSeek Harness Web GUI at http://127.0.0.1:58031/. Do not start a replacement server.'
     const body = JSON.parse(prepareChatBody(JSON.stringify({
       model: 'deepseek-v4-flash',
       messages: [{ role: 'system', content }],
     })))
-    expect((body['messages'][0] as { content: string }).content)
-      .toBe('You are interacting with the user through the Web GUI at http://127.0.0.1:58031/. Do not start a replacement server.')
+    const message = body['messages'][0] as { role: string, content: string }
+    expect(message.role).toBe('user')
+  })
+
+  it('keeps a neutral system prompt on the system role', () => {
+    // A plain OpenAI client's system message must not be demoted: the check
+    // keys on the harness fingerprint, not on the role by itself.
+    const body = JSON.parse(prepareChatBody(JSON.stringify({
+      model: 'deepseek-v4-flash',
+      messages: [{ role: 'system', content: 'Be concise and answer in English.' }, { role: 'user', content: 'hi' }],
+    })))
+    expect((body['messages'][0] as { role: string }).role).toBe('system')
   })
 
   it('rewrites the @-file-reference paragraph that trips 11128 as a whole', () => {

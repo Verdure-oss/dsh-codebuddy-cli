@@ -19,17 +19,39 @@ import { randomUUID } from 'node:crypto'
 import type { CodeBuddyClientIdentity } from './client-identity.ts'
 import { clientIdentityHeaders } from './client-identity.ts'
 
-/** Base URL for the CN CodeBuddy upstream. */
-const CN_BASE = 'https://copilot.tencent.com'
+/**
+ * Deployments the sign-in flow can target.
+ *
+ * Both expose the same `/v2/plugin/auth/*` surface — verified against the live
+ * gateways: `state` returns a `state` + `authUrl` on each host, and `token`
+ * answers `11217 login ing…` while the browser half is still pending. What
+ * differs is only the host, and the account a user signs into there:
+ *
+ * - `cn` — the China site, whose API host is `copilot.tencent.com`;
+ * - `global` — WorkBuddy (`www.workbuddy.ai`), the international site this
+ *   plugin also serves chat and billing from.
+ *
+ * `www.codebuddy.ai` (the CodeBuddy international site) is a third deployment.
+ * Its `state` endpoint answers too, but its chat plane rejects this plugin's
+ * requests (`11128 request illegal`) and its catalog paths 404, so signing in
+ * there would produce an account that cannot be served.
+ */
+export type OAuthRegion = 'cn' | 'global'
 
-/** OAuth state endpoint. */
-const STATE_URL = `${CN_BASE}/v2/plugin/auth/state`
+/** Host that serves each region's sign-in and token endpoints. */
+const OAUTH_BASE: Readonly<Record<OAuthRegion, string>> = {
+  cn: 'https://copilot.tencent.com',
+  global: 'https://www.workbuddy.ai',
+}
 
-/** OAuth token polling endpoint. */
-const TOKEN_URL = `${CN_BASE}/v2/plugin/auth/token`
+/** The region narrowed from untrusted input; undefined when it names neither. */
+export function parseOAuthRegion(value: unknown): OAuthRegion | undefined {
+  if (value === 'cn' || value === 'global') return value
+  return undefined
+}
 
-/** Account info endpoint (called after token is obtained). */
-const ACCOUNT_URL = `${CN_BASE}/v2/plugin/auth/login/account`
+/** Account info endpoint path (called after a token is obtained). */
+const ACCOUNT_PATH = '/v2/plugin/auth/login/account'
 
 /** Upstream "pending" code — keep polling. */
 const PENDING_CODE = 11217
@@ -50,13 +72,15 @@ export interface OAuthLoginResult {
 }
 
 /** Headers for the state and token endpoints (no Authorization, identity only). */
-function oauthHeaders(identity: CodeBuddyClientIdentity): Record<string, string> {
+function oauthHeaders(identity: CodeBuddyClientIdentity, region: OAuthRegion): Record<string, string> {
   return {
     'Accept': 'application/json, text/plain, */*',
     'Content-Type': 'application/json',
     'X-Requested-With': 'XMLHttpRequest',
     'X-Product': 'SaaS',
-    'X-Domain': 'copilot.tencent.com',
+    // The host the sign-in runs against, not a constant: the global gateway
+    // scopes the flow to its own domain.
+    'X-Domain': new URL(OAUTH_BASE[region]).hostname,
     'X-No-Authorization': 'true',
     'X-No-User-Id': 'true',
     'X-No-Enterprise-Id': 'true',
@@ -103,10 +127,13 @@ function optionalString(value: unknown): string | undefined {
  * @param identity - resolved client identity for request headers.
  * @returns the `authUrl` the user should open, and the internal `state`.
  */
-export async function startOAuthLogin(identity: CodeBuddyClientIdentity): Promise<{ authUrl: string; state: string }> {
-  const response = await fetch(`${STATE_URL}?platform=CLI`, {
+export async function startOAuthLogin(
+  identity: CodeBuddyClientIdentity,
+  region: OAuthRegion = 'cn',
+): Promise<{ authUrl: string; state: string }> {
+  const response = await fetch(`${OAUTH_BASE[region]}/v2/plugin/auth/state?platform=CLI`, {
     method: 'POST',
-    headers: oauthHeaders(identity),
+    headers: oauthHeaders(identity, region),
     body: '{}',
     signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
   })
@@ -129,11 +156,18 @@ export async function startOAuthLogin(identity: CodeBuddyClientIdentity): Promis
  *
  * @param state - the state from {@link startOAuthLogin}.
  * @param identity - resolved client identity for request headers.
+ * @param region - the same region {@link startOAuthLogin} was called with; the
+ *   `state` is only meaningful on the host that minted it.
  */
-export async function pollOAuthLogin(state: string, identity: CodeBuddyClientIdentity): Promise<OAuthLoginResult | undefined> {
-  const response = await fetch(`${TOKEN_URL}?state=${encodeURIComponent(state)}`, {
+export async function pollOAuthLogin(
+  state: string,
+  identity: CodeBuddyClientIdentity,
+  region: OAuthRegion = 'cn',
+): Promise<OAuthLoginResult | undefined> {
+  const base = OAUTH_BASE[region]
+  const response = await fetch(`${base}/v2/plugin/auth/token?state=${encodeURIComponent(state)}`, {
     method: 'GET',
-    headers: oauthHeaders(identity),
+    headers: oauthHeaders(identity, region),
     signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
   })
   if (!response.ok) return undefined
@@ -155,7 +189,11 @@ export async function pollOAuthLogin(state: string, identity: CodeBuddyClientIde
   const refreshExpiresAtMs = typeof envelope.data['refreshExpiresAt'] === 'number'
     ? expiryToMs(envelope.data['refreshExpiresAt'] as number)
     : undefined
-  const domain = optionalString(envelope.data['domain']) ?? ''
+  // The account's home domain decides which upstream serves it later (a
+  // `workbuddy.ai` account must never be routed to the CN gateway), so an
+  // answer that omits it falls back to the host that just minted the token
+  // rather than to the empty string, which `regionOf` reads as CN.
+  const domain = optionalString(envelope.data['domain']) ?? new URL(base).hostname
 
   // Fetch account info (uid, nickname, enterpriseId).
   let uid = ''
@@ -163,14 +201,14 @@ export async function pollOAuthLogin(state: string, identity: CodeBuddyClientIde
   let enterpriseId: string | undefined
   try {
     const accountHeaders: Record<string, string> = {
-      ...oauthHeaders(identity),
+      ...oauthHeaders(identity, region),
       'Authorization': `Bearer ${accessToken}`,
     }
     if (domain !== '') {
       accountHeaders['X-Domain'] = domain
       delete accountHeaders['X-No-Department-Info']
     }
-    const accResponse = await fetch(`${ACCOUNT_URL}?state=${encodeURIComponent(state)}`, {
+    const accResponse = await fetch(`${base}${ACCOUNT_PATH}?state=${encodeURIComponent(state)}`, {
       method: 'GET',
       headers: accountHeaders,
       signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),

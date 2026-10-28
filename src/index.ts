@@ -276,8 +276,8 @@ export function apply(ctx: Context, rawConfig: Config): void {
     refreshToken: credential => client.refreshToken(credential),
     fetchUsage: credential => client.fetchUsage(credential),
     accountStore,
-    loginStart: identity => startOAuthLogin(identity),
-    loginPoll: (state, identity) => pollOAuthLogin(state, identity),
+    loginStart: (identity, region) => startOAuthLogin(identity, region),
+    loginPoll: (state, identity, region) => pollOAuthLogin(state, identity, region),
     resolveIdentity: () => ensureClientIdentity(),
   }))
 

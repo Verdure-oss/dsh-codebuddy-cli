@@ -74,6 +74,8 @@ export const en = {
   tabRemaining: 'Remaining credit',
   // —— Account cards (workbuddy-switch style) ——
   accountCardAdd: 'OAuth sign in to add account',
+  accountLoginRegion: 'Sign-in site',
+  accountLoginRegionHint: 'China (codebuddy.cn) and Global (workbuddy.ai) are separate products with separate accounts; pick the one the account was created on.',
   // —— Paste-token import ——
   accountImportOpen: 'Add by pasting tokens',
   accountImportHint: 'Paste the refresh_token from CodeBuddy. The refresh token is the long-lived credential, so it is the one that matters — an access token alone expires and cannot be renewed.',
@@ -272,6 +274,8 @@ export const zh: Record<CodeBuddySettingsKey, string> = {
   tabRemaining: '剩余积分',
   // —— 账号卡片（workbuddy-switch 同款） ——
   accountCardAdd: '扫码登录添加账号',
+  accountLoginRegion: '登录站点',
+  accountLoginRegionHint: '国内站（codebuddy.cn）与国际站（workbuddy.ai）是两个独立产品、账号不通用，请在账号所属的站点登录。',
   // —— 粘贴 Token 导入 ——
   accountImportOpen: '粘贴 Token 添加',
   accountImportHint: '粘贴 CodeBuddy 的 refresh_token。refresh_token 是长期凭证，是关键的那个——单独一个 access_token 会过期且无法续期。',

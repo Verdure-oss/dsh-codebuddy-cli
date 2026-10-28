@@ -296,15 +296,22 @@ declare function regionOf(domain: string): CodeBuddyRegion;
  * Normalize an OpenAI chat-completions body for the CodeBuddy upstream:
  * force `stream: true` (the upstream rejects non-streaming), flatten
  * `tool_choice` (the upstream's field is a string; object forms return 400),
- * and rewrite `developer` messages as `system`.
+ * rewrite `developer` messages as `system`, demote a harness system prompt to
+ * the `user` role, and drop a `reasoning_effort` the model cannot take.
  *
  * The `developer` rewrite is load-bearing: pi-ai emits the system prompt as
  * `role: "developer"` (the OpenAI convention it adopted), but the CodeBuddy
  * upstream rejects that role with HTTP 400 code 11128 ("Illegal API
  * invocation from an unapproved channel"). Rewriting to `system` is the
  * compatible spelling the upstream accepts.
+ *
+ * @param source - the raw request body pi-ai produced.
+ * @param allowedEfforts - optional per-model accepted reasoning levels; the
+ *   shim supplies it from its catalog so a level inherited from another model
+ *   or provider cannot reach the provider.
+ * @returns the normalized body, or `source` unchanged when it is not an object.
  */
-declare function prepareChatBody(source: string): string;
+declare function prepareChatBody(source: string, allowedEfforts?: (model: string) => readonly string[] | undefined): string;
 /**
  * Upstream HTTP client. One instance serves the whole plugin; requests take
  * the credential explicitly so token refreshes apply on the next call.

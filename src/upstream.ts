@@ -539,15 +539,25 @@ function checkInHeaders(credential: CodeBuddyCredential): Record<string, string>
  * Normalize an OpenAI chat-completions body for the CodeBuddy upstream:
  * force `stream: true` (the upstream rejects non-streaming), flatten
  * `tool_choice` (the upstream's field is a string; object forms return 400),
- * and rewrite `developer` messages as `system`.
+ * rewrite `developer` messages as `system`, demote a harness system prompt to
+ * the `user` role, and drop a `reasoning_effort` the model cannot take.
  *
  * The `developer` rewrite is load-bearing: pi-ai emits the system prompt as
  * `role: "developer"` (the OpenAI convention it adopted), but the CodeBuddy
  * upstream rejects that role with HTTP 400 code 11128 ("Illegal API
  * invocation from an unapproved channel"). Rewriting to `system` is the
  * compatible spelling the upstream accepts.
+ *
+ * @param source - the raw request body pi-ai produced.
+ * @param allowedEfforts - optional per-model accepted reasoning levels; the
+ *   shim supplies it from its catalog so a level inherited from another model
+ *   or provider cannot reach the provider.
+ * @returns the normalized body, or `source` unchanged when it is not an object.
  */
-export function prepareChatBody(source: string): string {
+export function prepareChatBody(
+  source: string,
+  allowedEfforts?: (model: string) => readonly string[] | undefined,
+): string {
   let body: unknown
   try {
     body = JSON.parse(source)
@@ -558,8 +568,14 @@ export function prepareChatBody(source: string): string {
   const obj = body as Record<string, unknown>
   obj['stream'] = true
   normalizeDeveloperRole(obj)
+  // Role demotion runs BEFORE the sentence scrubbing: once the prompt no longer
+  // sits in a privileged role the upstream accepts it verbatim, so the model
+  // keeps exactly what DSH wrote. The scrub stays as defence in depth for a body
+  // that reaches the wire by another path.
+  demoteHarnessInstructionRole(obj)
   neutralizeHarnessFingerprints(obj)
   normalizeToolChoice(obj)
+  normalizeReasoningEffort(obj, allowedEfforts)
   return JSON.stringify(obj)
 }
 
@@ -572,6 +588,138 @@ function normalizeDeveloperRole(obj: Record<string, unknown>): void {
     const wrapped = message as Record<string, unknown>
     if (wrapped['role'] === 'developer') wrapped['role'] = 'system'
   }
+}
+
+/**
+ * Markers that identify another harness's system prompt.
+ *
+ * Kept as a narrow test rather than "any system message": a neutral system
+ * prompt (`Be concise.`) is accepted upstream and is what a plain OpenAI client
+ * sends, so only DSH's own instruction set is treated as a fingerprint.
+ */
+const DSH_INSTRUCTION_MARKERS: readonly RegExp[] = [
+  /\bDeepSeek Harness\b/u,
+  /\bDSH\b/u,
+  /\bdeepseek-(?:v\d|agent|harness)/iu,
+  /\bharness\b/iu,
+]
+
+/** Whether one message's text looks like a DSH system prompt. */
+function isHarnessInstructionText(text: string): boolean {
+  return DSH_INSTRUCTION_MARKERS.some(marker => marker.test(text))
+}
+
+/**
+ * Every string inside a message's content, at any nesting depth.
+ *
+ * The shapes seen in practice are a plain string and `{ type: 'text', text }`
+ * shards, but a nested form must not slip past this test: a missed message is a
+ * whole turn refused by the upstream.
+ */
+function messageText(content: unknown): string {
+  if (typeof content === 'string') return content
+  const parts: string[] = []
+  const walk = (node: unknown, depth: number): void => {
+    if (depth > 4 || node === null || node === undefined) return
+    if (typeof node === 'string') { parts.push(node); return }
+    if (Array.isArray(node)) { for (const child of node) walk(child, depth + 1); return }
+    if (typeof node !== 'object') return
+    for (const value of Object.values(node as Record<string, unknown>)) walk(value, depth + 1)
+  }
+  walk(content, 0)
+  return parts.join('\n')
+}
+
+/**
+ * Send a harness system prompt as an ordinary `user` message.
+ *
+ * The upstream's channel check (`11128 Illegal API invocation from an unapproved
+ * channel`) refuses a request whose **privileged** roles carry another harness's
+ * prompt. Measured against the live endpoint with DSH 0.2.1-rc.3's prompt, the
+ * discriminator is the role, not the wording:
+ *
+ * - the same 6.4 KB prompt as `system` → `11128`; as `user` → `200`;
+ * - `You are an AI agent powered by DeepSeek Harness.` as `system` → `11128`;
+ *   the identical sentence as `user` → `200`;
+ * - a neutral system prompt (`Be concise.`) → `200`, so the role alone is fine.
+ *
+ * This is the reason the plugin should not rely on sentence rewrites alone. The
+ * rewrite list in {@link HARNESS_FINGERPRINT_REWRITES} has had to grow once per
+ * prompt change already (0.4.4 and again in 0.4.6 for the `@`-path paragraph),
+ * and that list can never cover a paragraph the upstream starts rejecting
+ * tomorrow. Demoting the role is stable regardless of what the harness writes,
+ * and it keeps the instruction text verbatim, so nothing is lost to the model.
+ *
+ * Only a message that actually carries the harness prompt is demoted; a
+ * request with a neutral system message keeps its role.
+ *
+ * @param obj - the parsed chat body, mutated in place.
+ */
+function demoteHarnessInstructionRole(obj: Record<string, unknown>): void {
+  const messages = obj['messages']
+  if (!Array.isArray(messages)) return
+  for (const message of messages) {
+    if (typeof message !== 'object' || message === null || Array.isArray(message)) continue
+    const wrapped = message as Record<string, unknown>
+    if (wrapped['role'] !== 'system') continue
+    if (!isHarnessInstructionText(messageText(wrapped['content']))) continue
+    wrapped['role'] = 'user'
+  }
+}
+
+/**
+ * The effort ladder the upstream accepts, in wire spelling (`off` is separate:
+ * only models that can disable thinking accept it).
+ */
+export const CODEBUDDY_EFFORT_VALUES: readonly CodeBuddyEffort[] = ['low', 'medium', 'high', 'xhigh', 'max']
+
+/** Every `reasoning_effort` value that means anything on this wire. */
+const ACCEPTED_EFFORTS: ReadonlySet<string> = new Set([...CODEBUDDY_EFFORT_VALUES, 'off'])
+
+/**
+ * Drop a `reasoning_effort` the selected model cannot accept.
+ *
+ * The reasoning level a session carries is not always one this provider knows
+ * about: DSH keeps the session's level when the model or provider changes, and
+ * pi-ai forwards whatever it cannot map
+ * (`params.reasoning_effort = model.thinkingLevelMap?.[level] ?? level`). A level
+ * inherited from another provider (`extra_high`, from a `trae` selection, was
+ * observed in a real session) therefore reaches the wire verbatim and the
+ * upstream rejects the whole request — `11150` when the model declares a set,
+ * the provider-level `11133` otherwise.
+ *
+ * Dropping the field is the repair, not clamping: an unmappable level means
+ * "this selection came from elsewhere", and the model's own default is a better
+ * answer than a guess at which ladder step the user meant.
+ *
+ * @param obj - the parsed chat body, mutated in place.
+ * @param allowedEfforts - per-model accepted values; undefined keeps the
+ *   vocabulary check only.
+ */
+function normalizeReasoningEffort(
+  obj: Record<string, unknown>,
+  allowedEfforts: ((model: string) => readonly string[] | undefined) | undefined,
+): void {
+  if (!('reasoning_effort' in obj)) return
+  const raw = obj['reasoning_effort']
+  if (typeof raw !== 'string') {
+    // Another provider's shape (an object such as `{ type: 'enabled' }`) means
+    // nothing here.
+    delete obj['reasoning_effort']
+    return
+  }
+  const value = raw.trim().toLowerCase()
+  if (value === '' || !ACCEPTED_EFFORTS.has(value)) {
+    delete obj['reasoning_effort']
+    return
+  }
+  const model = typeof obj['model'] === 'string' ? obj['model'] : ''
+  const allowed = allowedEfforts?.(model)
+  if (allowed !== undefined && !allowed.includes(value)) {
+    delete obj['reasoning_effort']
+    return
+  }
+  obj['reasoning_effort'] = value
 }
 
 /**

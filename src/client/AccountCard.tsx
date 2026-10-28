@@ -458,7 +458,13 @@ export function AccountCards({ accounts, onChanged, t }: {
   onChanged: () => void
   t: AccountCardInjected['t']
 }): React.ReactNode {
-  const [loginState, setLoginState] = useState<{ phase: 'idle' } | { phase: 'starting' } | { phase: 'polling'; authUrl: string; state: string } | { phase: 'done'; error?: string }>({ phase: 'idle' })
+  const [loginState, setLoginState] = useState<{ phase: 'idle' } | { phase: 'starting' } | { phase: 'polling'; authUrl: string; state: string; region: 'cn' | 'global' } | { phase: 'done'; error?: string }>({ phase: 'idle' })
+  /**
+   * Which site the sign-in opens. The two deployments are separate products
+   * with separate accounts, so this is a user choice rather than something the
+   * Host can infer — the CN site cannot sign anyone into WorkBuddy.
+   */
+  const [loginRegion, setLoginRegion] = useState<'cn' | 'global'>('cn')
   const [importOpen, setImportOpen] = useState(false)
   const [importState, setImportState] = useState<
     { phase: 'idle' } | { phase: 'busy' } | { phase: 'done'; error?: string }
@@ -488,7 +494,8 @@ export function AccountCards({ accounts, onChanged, t }: {
           method: 'POST',
           headers: { 'content-type': 'application/json', accept: 'application/json' },
           credentials: 'same-origin',
-          body: JSON.stringify({ state: loginState.state }),
+          // The state was minted by one deployment, so the poll names it too.
+          body: JSON.stringify({ state: loginState.state, region: loginState.region }),
           ...controller.signal.aborted ? {} : { signal: controller.signal },
         })
         const body = await response.json().catch(() => undefined) as CodeBuddyLoginPollResult | undefined
@@ -519,7 +526,7 @@ export function AccountCards({ accounts, onChanged, t }: {
         method: 'POST',
         headers: { 'content-type': 'application/json', accept: 'application/json' },
         credentials: 'same-origin',
-        body: '{}',
+        body: JSON.stringify({ region: loginRegion }),
       })
       const body = await response.json().catch(() => undefined) as CodeBuddyLoginStartResult | undefined
       if (body === undefined || !body.ok || body.authUrl === undefined || body.state === undefined) {
@@ -528,7 +535,7 @@ export function AccountCards({ accounts, onChanged, t }: {
         return
       }
       window.open(body.authUrl, '_blank', 'noopener')
-      setLoginState({ phase: 'polling', authUrl: body.authUrl, state: body.state })
+      setLoginState({ phase: 'polling', authUrl: body.authUrl, state: body.state, region: loginRegion })
     } catch (cause: unknown) {
       setLoginState({ phase: 'done', error: t('accountLoginFailed', { message: cause instanceof Error ? cause.message : t('requestFailed') }) })
     }
@@ -589,7 +596,25 @@ export function AccountCards({ accounts, onChanged, t }: {
     <div>
       <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 8, flexWrap: 'wrap' }}>
         <p className={css.bodyText} style={{ margin: 0 }}>{t('accountPanelHint')}</p>
-        <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap' }}>
+        <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap', alignItems: 'center' }}>
+          <select
+            value={loginRegion}
+            aria-label={t('accountLoginRegion')}
+            title={t('accountLoginRegionHint')}
+            disabled={loginState.phase === 'starting' || loginState.phase === 'polling'}
+            onChange={event => { setLoginRegion(event.target.value === 'global' ? 'global' : 'cn') }}
+            style={{
+              padding: '6px 8px',
+              borderRadius: 8,
+              border: '0.5px solid var(--dsw-alias-border-l3)',
+              background: 'var(--dsw-alias-bg-base)',
+              color: 'var(--dsw-alias-label-primary)',
+              fontSize: 13,
+            }}
+          >
+            <option value="cn">{t('accountImportDomainCn')}</option>
+            <option value="global">{t('accountImportDomainGlobal')}</option>
+          </select>
           <button
             type="button"
             className={css.refresh}

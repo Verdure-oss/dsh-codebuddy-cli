@@ -77,7 +77,10 @@ describe('host heartbeat', () => {
     // this very PID) is alive.
     const genuine = { ...recycled, registeredAt: Date.now() }
     expect(isHeartbeatProcessAlive(genuine)).toBe(true)
-  })
+    // Three synchronous process-start-time probes: on Windows without `wmic`
+    // (11 24H2+) each one spawns PowerShell and can take over a second, so the
+    // default 5 s budget is not enough on a loaded machine.
+  }, 30_000)
 
   it('treats a malformed heartbeat file as absent', async () => {
     root = await mkdtemp(join(tmpdir(), 'wb-heartbeat-malformed-'))

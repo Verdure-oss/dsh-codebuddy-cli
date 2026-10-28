@@ -21,7 +21,7 @@ import { Readable } from 'node:stream'
 import type { CodeBuddyCredentialStore } from './auth.ts'
 import type { CodeBuddyCatalog } from './catalog.ts'
 import { hostIsLoopback, originIsLoopback } from './loopback.ts'
-import { prepareChatBody, CodeBuddyUpstreamClient, type UpstreamErrorKind } from './upstream.ts'
+import { prepareChatBody, CodeBuddyUpstreamClient, CODEBUDDY_EFFORT_VALUES, type UpstreamErrorKind } from './upstream.ts'
 
 /** Minimal logger surface the plugin context already provides. */
 export interface ShimLogger {
@@ -114,6 +114,26 @@ export function createCodeBuddyShim(options: CodeBuddyShimOptions): CodeBuddyShi
   // The shim never forwards it upstream — the real credential comes from the
   // store. A local attacker who can hit the port still cannot forge this.
   const SHARED_SECRET = randomBytes(32).toString('base64url')
+
+  /**
+   * The reasoning levels the body's own model accepts, read from the live
+   * catalog so a level inherited from another model or provider (pi-ai
+   * forwards unknown levels verbatim) is dropped here instead of killing the
+   * turn with an upstream `11133`/`11150`.
+   *
+   * A model the catalog does not list returns undefined: catalog membership is
+   * advisory everywhere else in this plugin, so an unlisted id keeps only the
+   * vocabulary check rather than having its effort silently removed.
+   */
+  const effortPolicy = (): ((model: string) => readonly string[] | undefined) => modelId => {
+    const info = catalog.current().find(entry => entry.id === modelId)
+    if (info === undefined) return undefined
+    const reasoning = info.reasoning
+    if (reasoning === undefined || reasoning.supports !== true) return []
+    const declared = reasoning.supportedEfforts
+    const ladder = declared !== undefined && declared.length > 0 ? declared : CODEBUDDY_EFFORT_VALUES
+    return reasoning.canDisableThinking === true ? [...ladder, 'off'] : [...ladder]
+  }
 
   /** Constant-time bearer check; absent or mismatched bearers are rejected. */
   function bearerOk(req: IncomingMessage): boolean {
@@ -211,7 +231,7 @@ export function createCodeBuddyShim(options: CodeBuddyShimOptions): CodeBuddyShi
     }
 
     const raw = (await readBody(req)).toString('utf8')
-    const prepared = prepareChatBody(raw)
+    const prepared = prepareChatBody(raw, effortPolicy())
 
     const controller = new AbortController()
     req.on('close', () => controller.abort())

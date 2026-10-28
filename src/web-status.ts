@@ -18,7 +18,8 @@ import { regionOf } from './upstream.ts'
 import { filterEnabledModels } from './catalog.ts'
 import type { CodeBuddyModelInfo } from './catalog.ts'
 import { hostIsLoopback, originIsLoopback } from './loopback.ts'
-import { generateAccountId } from './oauth.ts'
+import { generateAccountId, parseOAuthRegion } from './oauth.ts'
+import type { OAuthRegion } from './oauth.ts'
 import {
   CODEBUDDY_CHECKIN_PATH,
   CODEBUDDY_DOCK_PREFERENCE_PATH,
@@ -108,9 +109,14 @@ export interface CodeBuddyStatusRouteOptions {
   /** Multi-account store; when present, the card shows the account panel. */
   accountStore?: AccountStore
   /** Start an OAuth login, returning an authUrl and state. */
-  loginStart?: (identity: CodeBuddyClientIdentity) => Promise<{ authUrl: string; state: string }>
+  /**
+   * Start an OAuth login on one deployment, returning an authUrl and state.
+   * The region picks the host (CN or WorkBuddy), because the two sites are
+   * separate products with separate sign-in sessions.
+   */
+  loginStart?: (identity: CodeBuddyClientIdentity, region: OAuthRegion) => Promise<{ authUrl: string; state: string }>
   /** Poll an OAuth login once; returns the account when done, undefined when pending. */
-  loginPoll?: (state: string, identity: CodeBuddyClientIdentity) => Promise<import('./oauth.ts').OAuthLoginResult | undefined>
+  loginPoll?: (state: string, identity: CodeBuddyClientIdentity, region: OAuthRegion) => Promise<import('./oauth.ts').OAuthLoginResult | undefined>
   /** Resolve the current client identity for OAuth headers. */
   resolveIdentity?: () => Promise<CodeBuddyClientIdentity>
 }
@@ -765,6 +771,30 @@ function checkLoopbackPost(req: IncomingMessage, res: ServerResponse): boolean {
 }
 
 /**
+ * Read the optional `region` out of the login-start body.
+ *
+ * Returns `undefined` when the field is absent (the caller then keeps the CN
+ * default) and the literal `'invalid'` when it is present but names a region
+ * this flow cannot serve — a silent fallback would start a CN login for someone
+ * who asked for the international site, which is the confusing failure this
+ * parameter exists to remove. An empty body is "no region", not an error: the
+ * card's older builds sent `{}`.
+ */
+function parseLoginRegion(body: string): OAuthRegion | undefined | 'invalid' {
+  if (body.trim() === '') return undefined
+  let parsed: unknown
+  try {
+    parsed = JSON.parse(body)
+  } catch {
+    return undefined
+  }
+  if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) return undefined
+  const field = (parsed as { region?: unknown }).region
+  if (field === undefined || field === null) return undefined
+  return parseOAuthRegion(field) ?? 'invalid'
+}
+
+/**
  * The login-start handler. POSTs to the upstream state endpoint and returns
  * the authUrl + state. The card opens the authUrl in a new tab and then polls
  * the poll endpoint.
@@ -783,8 +813,16 @@ export function codeBuddyLoginStartHandler(
       return
     }
     try {
+      // The region picks which deployment's sign-in is started. Both expose the
+      // same endpoints, so only the host differs; an unset region keeps the
+      // historical CN behaviour.
+      const region = parseLoginRegion(await readBody(req))
+      if (region === 'invalid') {
+        json(res, 400, { error: 'expected {"region"?: "cn" | "global"}' })
+        return
+      }
       const identity = await deps.resolveIdentity()
-      const { authUrl, state } = await deps.loginStart(identity)
+      const { authUrl, state } = await deps.loginStart(identity, region ?? 'cn')
       json(res, 200, { ok: true, authUrl, state } satisfies CodeBuddyLoginStartResult)
     } catch (error: unknown) {
       json(res, 200, { ok: false, error: safeMessage(error) } satisfies CodeBuddyLoginStartResult)
@@ -811,7 +849,7 @@ export function codeBuddyLoginPollHandler(
     }
     try {
       const body = await readBody(req)
-      let parsed: { state?: unknown }
+      let parsed: { state?: unknown, region?: unknown }
       try {
         parsed = JSON.parse(body)
       } catch {
@@ -823,8 +861,11 @@ export function codeBuddyLoginPollHandler(
         json(res, 400, { error: 'expected {"state": string}' })
         return
       }
+      const region = parseOAuthRegion(parsed.region)
       const identity = await deps.resolveIdentity()
-      const result = await deps.loginPoll(state, identity)
+      // The `state` was minted by one deployment only, so the poll must go back
+      // to that same host; the card echoes the region it started with.
+      const result = await deps.loginPoll(state, identity, region ?? 'cn')
       if (result === undefined) {
         json(res, 200, { done: false } satisfies CodeBuddyLoginPollResult)
         return
@@ -881,6 +922,44 @@ function claimString(claims: Record<string, unknown> | undefined, key: string): 
   if (claims === undefined) return undefined
   const value = claims[key]
   return typeof value === 'string' && value !== '' ? value : undefined
+}
+
+/**
+ * Which upstream deployment a refresh token was minted for, read from its
+ * `iss` claim; undefined when the token is opaque or names no known realm.
+ *
+ * The three CodeBuddy realms are separate deployments with their own gateway,
+ * and a token from one is not accepted by another — the foreign host answers
+ * with an HTML edge page instead of a JSON business error. Only two of them are
+ * reachable by this plugin:
+ *
+ * - `www.codebuddy.cn` — the CN site, whose API host is `copilot.tencent.com`;
+ * - `workbuddy.ai` — the global site, which serves both the API and billing
+ *   paths itself;
+ * - `www.codebuddy.ai` — the CodeBuddy international site. Verified against the
+ *   live gateways: its tokens get `401 Authorization Required` from
+ *   `copilot.tencent.com`, a 500 openresty page from `www.workbuddy.ai`, and its
+ *   chat plane answers `11128 request illegal`. Reporting it as unsupported is
+ *   honest; sending it upstream would only produce a gateway page.
+ *
+ * @param token - the pasted refresh token.
+ * @returns the realm the token belongs to, or undefined when unreadable.
+ */
+function realmOfToken(token: string): 'cn' | 'global' | 'unsupported' | undefined {
+  const issuer = claimString(claimsFromToken(token), 'iss')
+  if (issuer === undefined) return undefined
+  let hostname: string
+  try {
+    hostname = new URL(issuer).hostname.toLowerCase()
+  } catch {
+    return undefined
+  }
+  // `codebuddy.ai` is checked before `codebuddy.cn` so a host such as
+  // `www.codebuddy.ai` can never fall through to the CN arm.
+  if (hostname === 'codebuddy.ai' || hostname.endsWith('.codebuddy.ai')) return 'unsupported'
+  if (hostname === 'codebuddy.cn' || hostname.endsWith('.codebuddy.cn')) return 'cn'
+  if (hostname === 'workbuddy.ai' || hostname.endsWith('.workbuddy.ai')) return 'global'
+  return undefined
 }
 
 /**
@@ -945,13 +1024,39 @@ export function codeBuddyImportAccountHandler(
       const nicknameFromToken = claimString(claims, 'nickname') ?? claimString(claims, 'preferred_username')
       const enterpriseFromToken = claimString(claims, 'enterprise_id')
 
+      // The refresh token is itself a JWT whose `iss` names the realm that
+      // minted it. That realm, not the card's radio, is the authoritative
+      // answer to "which upstream can serve this credential": a `codebuddy.cn`
+      // token only works on the CN deployment, a `workbuddy.ai` token only on
+      // the global one, and `codebuddy.ai` is a third deployment this plugin
+      // has no base or header profile for. Handing such a token to the wrong
+      // host does not produce a JSON business error — the gateway answers with
+      // an HTML page (`401 Authorization Required` from the CN edge,
+      // `500 Internal Server Error` from the global one), which is why the
+      // failure used to surface as "non-JSON (http 500)" with no explanation.
+      const refreshRealm = realmOfToken(refreshToken)
+      if (refreshRealm === 'unsupported') {
+        json(res, 200, {
+          ok: false,
+          error: 'this token was issued by www.codebuddy.ai (the CodeBuddy international site), which this plugin'
+            + ' cannot serve: it supports www.codebuddy.cn and workbuddy.ai accounts only. Sign in on one of those'
+            + ' sites and paste a refresh token from there.',
+        } satisfies CodeBuddyImportAccountResult)
+        return
+      }
+
       // Probe with the refresh token: it is the credential that both proves the
-      // account is live and yields the tokens we store. The domain decides
-      // which regional upstream is called, so an explicit choice wins, then the
-      // pasted token's region, then the CN default.
-      const probeDomain = pastedDomain !== ''
-        ? pastedDomain
-        : (regionOf(domainFromClaims(claims) ?? '') === 'global' ? (domainFromClaims(claims) ?? '') : '')
+      // account is live and yields the tokens we store. The realm the token
+      // itself declares wins over the card's choice, because a mismatch is not
+      // recoverable upstream; the explicit choice is the fallback for an opaque
+      // (non-JWT) token that carries no realm at all.
+      const probeDomain = refreshRealm === 'cn'
+        ? 'www.codebuddy.cn'
+        : refreshRealm === 'global'
+          ? 'workbuddy.ai'
+          : pastedDomain !== ''
+            ? pastedDomain
+            : (regionOf(domainFromClaims(claims) ?? '') === 'global' ? (domainFromClaims(claims) ?? '') : '')
       const probe = {
         accessToken: pastedAccess,
         refreshToken,
