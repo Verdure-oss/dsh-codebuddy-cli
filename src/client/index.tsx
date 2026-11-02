@@ -2,6 +2,13 @@
 
 import type { Context as ClientContext } from '@deepseek-ai/cordis'
 import type {} from '@deepseek-ai/dsh-client-ui-settings-plugins/client'
+// Type-only: DSH 0.2.1-rc.5 moved plugin configuration from Settings to the
+// sidebar's Plugins page. That page declares `plugins.bundle.config`, a keyed
+// slot whose entry renders inside the bundle's own page. Importing the
+// package's client types puts the slot name in the registry's union so
+// `register` accepts it; a host that predates the page simply never declares
+// the slot, and `ctx.slots.inject` then never runs the callback.
+import type {} from '@deepseek-ai/dsh-client-ui-plugin-manager/client'
 // Type-only: the settings shell declares the `settings.plugins.tab` slot in its
 // own SlotMap merge (ui-settings/src/client/contract/slots.ts) precisely so tab
 // contributors can type against it without depending on one another. Without
@@ -33,6 +40,17 @@ declare module '@deepseek-ai/dsh-client-ui-slots' {
 
 /** Stable browser-plugin name. */
 export const name = 'dsh-codebuddy-cli-client'
+
+/**
+ * This bundle's npm package name.
+ *
+ * `plugins.bundle.config` is a keyed slot: the Plugins page looks up the entry
+ * by the package name of the bundle whose page it is rendering. Spelling it
+ * here matches `package.json`; `tests/client-bundle-contract.spec.ts` asserts
+ * the two stay equal, because a mismatch would silently leave the card
+ * unreachable again.
+ */
+export const PLUGIN_PACKAGE_NAME = 'dsh-codebuddy-cli'
 /**
  * Client services required by the Plugin configuration contribution.
  *
@@ -117,6 +135,23 @@ export function apply(ctx: ClientContext): void {
       locale: namespace,
       inject: (): CodeBuddyCreditDockInjected => ({ t: creditT }),
     }, CodeBuddyCreditDock))
+
+    // DSH 0.2.1-rc.5 moved a plugin's configuration out of Settings: the
+    // sidebar's Plugins page renders each bundle's own page and reserves
+    // `plugins.bundle.config` for content the bundle itself contributes. The
+    // page keys that slot by the bundle's package name and passes
+    // `{ view: 'page' }`, so the card mounts between the bundle's description
+    // and its row list — exactly where the Settings tab used to put it.
+    //
+    // Without this registration the card is unreachable on rc.5: its old home
+    // (`settings.plugins.tab`) still exists as a slot but the Settings section
+    // no longer renders a tab per plugin, so nothing consumes it.
+    ctx.slots.inject('plugins.bundle.config', () => ctx.slots.register({
+      name: 'plugins.bundle.config',
+      key: PLUGIN_PACKAGE_NAME,
+      locale: namespace,
+      inject: (): CodeBuddyPluginCardInjected => ({ t }),
+    }, CodeBuddyPluginCard))
   } catch (error: unknown) {
     // Degrade silently on the page: the host provider still serves models.
     // Developers see the full cause in the browser console; users see no banner.

@@ -33,6 +33,31 @@ maybe('built client bundle slot + icon contract', () => {
     expect(bundle).toContain('settings.plugins.tab')
   })
 
+  it('registers the Plugins-page slot DSH 0.2.1-rc.5 renders the card in', () => {
+    // rc.5 moved a plugin's configuration out of Settings: the sidebar's
+    // Plugins page renders each bundle's own page and reserves
+    // `plugins.bundle.config` for content the bundle contributes. The old
+    // `settings.plugins.tab` slot still exists but the Settings section no
+    // longer renders a tab per plugin, so a card registered only there is
+    // unreachable — which is exactly how the card disappeared on rc.5.
+    expect(bundle).toContain('plugins.bundle.config')
+  })
+
+  it('keys that Plugins-page registration by the bundle package name', () => {
+    // `plugins.bundle.config` is a KEYED slot: the page looks the entry up by
+    // the package name of the bundle whose page it is rendering. A wrong key
+    // silently leaves the card unreachable, so the constant is asserted here
+    // and in `PLUGIN_PACKAGE_NAME` below.
+    expect(bundle).toMatch(/key:\s*(?:PLUGIN_PACKAGE_NAME|"dsh-codebuddy-cli")/)
+  })
+
+  it('asserts the package-name constant matches package.json', () => {
+    const pkg = JSON.parse(readFileSync(fileURLToPath(new URL('../package.json', import.meta.url)), 'utf8')) as {
+      name: string
+    }
+    expect(pkg.name).toBe('dsh-codebuddy-cli')
+  })
+
   it('still registers the legacy slot name so older DSH builds keep working', () => {
     expect(bundle).toContain('settings.plugin.item')
   })
